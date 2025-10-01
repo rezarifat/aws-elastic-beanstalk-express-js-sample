@@ -8,16 +8,19 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20'))
   }
   stages {
-    stage('Checkout') { steps { checkout scm } }
-
-    stage('Install & Test (Node 16)') {
-      agent { docker { image 'node:16' args '-u root:root' } }
-      steps {
-        sh 'node -v'
-        sh 'npm install --save'
-        sh 'npm test || echo "No tests found"'
-      }
-    }
+	stage('Install & Test (Node 16)') {
+	  agent {
+	    docker {
+	      image 'node:16'
+	      args  '-u root:root'
+	    }
+	  }
+	  steps {
+	    sh 'node -v'
+	    sh 'npm install --save'
+	    sh 'npm test || echo "No tests found"'
+	  }
+	}
 
     stage('Build & Push Docker Image') {
       steps {
