@@ -1,59 +1,86 @@
 pipeline {
   agent any
-  environment {
-    IMAGE_NAME = 'rezarifat/project2' 
-  }
+
   options {
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds()        // avoid H2 DB lock races in OWASP cache
   }
+
+  environment {
+    IMAGE_NAME       = 'rezarifat/project2'    // <-- your Docker Hub repo
+    DOCKERHUB_CREDS  = 'dockerhub-creds'       // <-- Jenkins cred (user/pass or token)
+    // The NVD API key is provided at runtime via credentials (ID: nvd-api-key)
+  }
+
   stages {
-	stage('Install & Test (Node 16)') {
-	  agent {
-	    docker {
-	      image 'node:16'
-	      args  '-u root:root'
-	    }
-	  }
-	  steps {
-	    sh 'node -v'
-	    sh 'npm install --save'
-	    sh 'npm test || echo "No tests found"'
-	  }
-	}
+
+    stage('Install & Test (Node 16)') {
+      steps {
+        script {
+          // Runs npm steps inside a Node 16 container.
+          // NOTE: Jenkins and DinD must share the jenkins-data volume so the workspace mounts correctly.
+          docker.image('node:16').inside('-u root:root') {
+            sh '''
+              node -v
+              npm install --save --no-audit --fund=false
+              npm test || echo "No tests found"
+            '''
+          }
+        }
+      }
+    }
 
     stage('Build & Push Docker Image') {
       steps {
-        script {
-          docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-creds') {
-            def tag = "${IMAGE_NAME}:${env.BUILD_NUMBER}"
-            def img = docker.build(tag)
-            img.push()
-            img.push('latest')
-          }
+        withCredentials([usernamePassword(
+            credentialsId: "${DOCKERHUB_CREDS}",
+            usernameVariable: 'DOCKER_USER',
+            passwordVariable: 'DOCKER_PASS'
+        )]) {
+          sh '''
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+
+            docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+            docker tag ${IMAGE_NAME}:${BUILD_NUMBER} index.docker.io/${IMAGE_NAME}:${BUILD_NUMBER}
+            docker push index.docker.io/${IMAGE_NAME}:${BUILD_NUMBER}
+
+            docker tag ${IMAGE_NAME}:${BUILD_NUMBER} index.docker.io/${IMAGE_NAME}:latest
+            docker push index.docker.io/${IMAGE_NAME}:latest
+          '''
         }
       }
     }
 
     stage('Dependency Scan (OWASP) - fail on High/Critical') {
       steps {
-        sh '''
-          mkdir -p odc-data odc-report
-          docker run --rm \
-            -v "$PWD":/src \
-            -v "$PWD/odc-data":/usr/share/dependency-check/data \
-            -v "$PWD/odc-report":/report \
-            owasp/dependency-check:latest \
-              --scan /src \
-              --format "HTML" \
-              --out /report \
-              --failOnCVSS 7
-        '''
+        // Store your NVD key in Jenkins as a Secret Text with ID: nvd-api-key
+        withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+          sh '''
+            mkdir -p odc-data odc-report
+            # Ensure the cache/report dirs are writable by the container user (uid 1000 is common)
+            chmod -R u+rwX odc-data odc-report || true
+
+            docker run --rm --name depcheck-$BUILD_NUMBER \
+              -e NVD_API_KEY=$NVD_API_KEY \
+              -v "$PWD":/src \
+              -v "$PWD/odc-data":/usr/share/dependency-check/data \
+              -v "$PWD/odc-report":/report \
+              owasp/dependency-check:latest \
+                --scan /src \
+                --format HTML \
+                --out /report \
+                --exclude node_modules \
+                --failOnCVSS 7
+          '''
+        }
       }
     }
   }
+
   post {
-    always { archiveArtifacts artifacts: 'odc-report/*,Dockerfile', fingerprint: true }
+    always {
+      archiveArtifacts artifacts: 'odc-report/*.html, odc-report/*.xml', fingerprint: true
+    }
   }
 }
 
